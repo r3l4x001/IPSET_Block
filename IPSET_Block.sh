@@ -42,8 +42,7 @@ VER="v3.04"
 #
 # NOTE: Whitelist will be automatically populated with local LAN subnet, but VLANs will need to be added manually e.g. 10.0.0.0/8 etc.
 #
-# Credit @adamm https://www.snbforums.com/threads/how-to-dynamically-ban-malicious-ips-using-ipset-firewall-addition.16798/#post-115872
-# Also Very good examples of using IPSETs for blocking dynamically! https://forums.gentoo.org/viewtopic-t-863121.html
+# Very good examples of using IPSETs for blocking dynamically! https://forums.gentoo.org/viewtopic-t-863121.html
 
 # Print between line beginning with '#==' to first blank line inclusive
 ShowHelp() {
