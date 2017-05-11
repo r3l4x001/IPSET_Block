@@ -1,6 +1,6 @@
 #!/bin/sh
-VER="v3.04"
-#======================================================================================================= © 2016-2017 Martineau, v3.04
+VER="v3.05"
+#======================================================================================================= © 2016-2017 Martineau, v3.05
 #
 # Dynamically block unsolicited access attempts using IPSETs. Useful if you have opened ports >1024 as hopefully hackers will
 #             start their attempts at the more common ports e.g. 22,23 etc. so will be banned BEFORE they reach your port!
@@ -50,13 +50,31 @@ ShowHelp() {
 }
 
 Delete_IPSETs () {
-	iptables -D INPUT -m set $MATCH_SET Whitelist src -j ACCEPT 2> /dev/null > /dev/null
-	iptables -D INPUT -m set $MATCH_SET Blacklist src -j DROP 2> /dev/null > /dev/null
 	iptables -D logdrop -m state --state NEW -j SET --add-set Blacklist src 2> /dev/null > /dev/null
-	ipset -q $FLUSH Whitelist
+	
+	iptables -D INPUT -m set $IPT_MATCHSET Blacklist $BLK_DIMENSIONS -j DROP 2> /dev/null
+	iptables -D INPUT -m set $IPT_MATCHSET Whitelist $WHT_DIMENSIONS -j ACCEPT 2> /dev/null
+
+	iptables -D INPUT -i $(nvram get wan0_ifname) -m state --state INVALID -j Blacklist  2> /dev/null		# WAN only
+	iptables -D INPUT                             -m state --state INVALID -j Blacklist  2> /dev/null		# ALL Interfaces
+	iptables -D INPUT -j Blacklist 2> /dev/null 
+
+	iptables -F Blacklist
+
+	iptables -D INPUT   -m set $IPT_MATCHSET Whitelist src             -j logaccept 2> /dev/null
+	iptables -D INPUT   -m set $IPT_MATCHSET Whitelist src             -j ACCEPT    2> /dev/null
+	
+	iptables -D FORWARD -m set $IPT_MATCHSET Whitelist src             -j logaccept 2> /dev/null
+	iptables -D FORWARD -m set $IPT_MATCHSET Whitelist src             -j ACCEPT    2> /dev/null
+
+	
+	iptables -D FORWARD -m set $IPT_MATCHSET Blacklist src            -j DROP      2> /dev/null
+
 	ipset -q $FLUSH Blacklist
-	ipset -q $DESTROY Whitelist
-	ipset    $DESTROY Blacklist
+	ipset -q $FLUSH Whitelist
+	ipset -q $FLUSH WhitelistSRCPort
+	ipset    $DESTROY Blacklist 2> /dev/null
+	ipset    $DESTROY Whitelist 2> /dev/null
 	rm $bannedips  2> /dev/null	# Reset counter '0'
 }
 Convert_HHMMSS_to_SECS () {
@@ -109,6 +127,11 @@ case $(ipset -v | grep -o "v[4,6]") in
   *) logger -st "($(basename $0))" $$ "**ERROR** Unknown ipset version: $(ipset -v). Exiting." && (echo -e "\a";exit 99);;
 esac
 
+# Same for IPTABLES :-(
+IPT_MATCHSET='--match-set'
+if [ -z "$(iptables -V | grep "v1.4")" ];then				# RT-N66U MIPS v1.3.8 ?...but does the Kernel support '-j SET --add-set' ??
+	IPT_MATCHSET='--set'
+fi
 
 # Need assistance!???
 if [ "$1" == "help" ] || [ "$1" == "-h" ]; then
@@ -161,7 +184,7 @@ case $ACTION in
 			bannedip=$2
 		fi
 		logger -st "($(basename $0))" $$  "Banning" $bannedip "- added to Blacklist....."
-		ipset -q -A Blacklist $bannedip
+		ipset -q $ADD Blacklist $bannedip
 		echo "$bannedip Is Now Banned"
 		;;
 	unban)
@@ -209,11 +232,11 @@ case $ACTION in
 			cp $DIR/IPSET_Block.config $DIR/IPSET_Block.config.preEDIT					# Save the config
 			sed -i 's/Blacklist/_Blacklist/g' $DIR/IPSET_Block.config					# Change the IPSET names in the saved config
 			sed -i 's/Whitelist/_Whitelist/g' $DIR/IPSET_Block.config
-			ipset -X _Blacklist 2> /dev/null;ipset -X _Whitelist 2> /dev/null			# Make sure the temporary swap IPSETs don't exist
+			ipset $DESTROY _Blacklist 2> /dev/null;ipset -X _Whitelist 2> /dev/null			# Make sure the temporary swap IPSETs don't exist
 			ipset $RESTORE -f  $DIR/IPSET_Block.config									# Do the restore.....
 			if [ $? -eq 0 ];then
-				ipset swap _Blacklist Blacklist;ipset swap _Whitelist Whitelist			# Perform the swap
-				ipset -X _Blacklist 2> /dev/null;ipset -X _Whitelist 2> /dev/null		# Delete the temporary IPSETs
+				ipset $SWAP _Blacklist Blacklist;ipset swap _Whitelist Whitelist			# Perform the swap
+				ipset $DESTROY _Blacklist 2> /dev/null;ipset -X _Whitelist 2> /dev/null		# Delete the temporary IPSETs
 			else
 				echo -e "\aWhoops!!!"
 				exit 99
@@ -229,7 +252,7 @@ case $ACTION in
 		read WHITELISTFILE
 		for IP in `cat $WHITELISTFILE`
 			do
-				ipset -q -A Whitelist $IP
+				ipset -q $ADD Whitelist $IP
 				echo $IP
 			done
 
@@ -245,9 +268,13 @@ case $ACTION in
 
 		# Optionally track which port is being targeted by the hacker
 		BLACKLIST_TYPE=$IPHASH
-		if [ "$(echo $@ | grep -c 'port')" -gt 0 ];then				# Port tracking requested?
+		BLK_DIMENSIONS="src"								# 1-dimension IPSET src='201.210.196.178'
+		if [ "$(echo $@ | grep -c 'port')" -gt 0 ];then					# Port tracking requested?
 			BLACKLIST_TYPE='hash:ip,port'
 		fi
+
+		WHITELIST_TYPE=$NETHASH
+		WHT_DIMENSIONS="src"
 
 		# Check if original 'logdrop' chain is to be implemented. i.e. 1-logdrop; 0-Blacklist chain method
 		USE_LOGDROP=0													# Use new Martineau non-logdrop custom Blacklist chain method
@@ -292,40 +319,30 @@ case $ACTION in
 			nvram commit
 		fi
 
-		# 'init' will restore IPSETs from file but 'init reset' will re-create empty IPSETs even if 'IPSET_Block.config' exists
-		if [ "$2" == "reset" ] || [ ! -s "${DIR}/IPSET_Block.config" ];then
-			logger -st "($(basename $0))" $$  "IPSETs: 'Blacklist/Whitelist' created EMPTY....." [$1 $2]
-			iptables -F Blacklist
-			Delete_IPSETs
-			ipset -q $CREATE Whitelist $NETHASH
-			ipset    $CREATE Blacklist $BLACKLIST_TYPE $TIMEOUT $RETAIN_SECS		# Entries are valid for say 86400 secs i.e. 24 hrs (IPSET v6.x only)
-		else
-			# Delete the Blacklist firewall rules to allow the Blacklist/Whitelist IPSETs to be deleted/restored (rather than swap!)
-			iptables -D INPUT -m set $MATCH_SET Blacklist src -j DROP 2> /dev/null
-			iptables -D INPUT -m set $MATCH_SET Whitelist src -j ACCEPT 2> /dev/null
-			
-			iptables -D INPUT -i $(nvram get wan0_ifname) -m state --state INVALID -j Blacklist  2> /dev/null		# WAN only
-			iptables -D INPUT                                -m state --state INVALID -j Blacklist  2> /dev/null		# ALL Interfaces
-			iptables -D INPUT -j Blacklist 2> /dev/null
-			iptables -D Blacklist -m state --state NEW -j SET --add-set Blacklist src 2> /dev/null
-						
-			ipset destroy Blacklist  2> /dev/null;ipset destroy Whitelist 2> /dev/null
+		# Delete the Blacklist/Whitelist IPSETs to be deleted/restored (rather than swap!)
+		Delete_IPSETs 
+
+		if [ "$2" != "reset" ] && [ -s "${DIR}/IPSET_Block.config" ];then
 			logger -st "($(basename $0))" $$  "IPSET restore from '"$DIR"/IPSET_Block.config' starting....."
 			ipset $RESTORE  < $DIR/IPSET_Block.config
-			XRETAIN_SECS=$(ipset $LIST Blacklist | head -n 4 | grep -E "^Header" | grep -oE "timeout.*" | cut -d" " -f2)
-			if [ ! -z XRETAIN_SECS ];then
-				RETAIN_SECS=XRETAIN_SECS						# Report the actual timeout value in the restore file
-			fi
+		else
+			ipset $CREATE Whitelist $WHITELIST_TYPE
+			ipset $CREATE Blacklist $BLACKLIST_TYPE $TIMEOUT $RETAIN_SECS		# Entries are valid for say 86400 secs i.e. 24 hrs (IPSET v6.x only)
+			logger -st "($(basename $0))" $$  "IPSETs: 'Blacklist/Whitelist' created EMPTY....." [$1 $2]
 		fi
-
+		
+		XRETAIN_SECS=$(ipset $LIST Blacklist | head -n 4 | grep -E "^Header" | grep -oE "timeout.*" | cut -d" " -f2)
+		if [ ! -z XRETAIN_SECS ];then
+			RETAIN_SECS=XRETAIN_SECS						# Report the actual timeout value in the restore file
+		fi
 
 		RULENO=$(iptables -nvL INPUT --line | grep "lo " | awk '{print $1}')
 		RULENO=$(($RULENO+1))
 
-		iptables -D INPUT -m set $MATCH_SET Blacklist src -j DROP 2> /dev/null
-		iptables -D INPUT -m set $MATCH_SET Whitelist src -j ACCEPT 2> /dev/null
-		iptables -I INPUT $RULENO -m set $MATCH_SET Blacklist src -j DROP
-		iptables -I INPUT $RULENO -m set $MATCH_SET Whitelist src -j ACCEPT
+		iptables -D INPUT -m set $IPT_MATCHSET Blacklist src -j DROP 2> /dev/null
+		iptables -D INPUT -m set $IPT_MATCHSET Whitelist src -j ACCEPT 2> /dev/null
+		iptables -I INPUT $RULENO -m set $IPT_MATCHSET Blacklist src -j DROP
+		iptables -I INPUT $RULENO -m set $IPT_MATCHSET Whitelist src -j ACCEPT
 		if [ "$?" -gt 0 ];then
 		   RC=$?
 		   logger -st "($(basename $0))" $$  "**ERROR** Unable to add - INPUT $MATCH_SET Whitelist RC="$RC
@@ -341,6 +358,7 @@ case $ACTION in
 			iptables -D INPUT -i $(nvram get wan0_ifname) -m state --state INVALID -j Blacklist 2> /dev/null		#WAN only
 			iptables -D INPUT                                -m state --state INVALID -j Blacklist 2> /dev/null
 			iptables -D INPUT -j Blacklist 2> /dev/null
+			iptables -D FORWARD -m set $IPT_MATCHSET Blacklist src -j DROP 2> /dev/null
 			iptables -D FORWARD ! -i br0 -o $(nvram get wan0_ifname) -j Blacklist 2> /dev/null
 			iptables -D FORWARD   -i $(nvram get wan0_ifname) -m state --state INVALID -j Blacklist  2> /dev/null
 
@@ -380,6 +398,7 @@ case $ACTION in
 
 			RULENO=$( iptables --line -nvL FORWARD | grep "DROP       all  --  !br0   eth0" | cut -d" " -f1)
 			iptables -I FORWARD $RULENO ! -i br0 -o $(nvram get wan0_ifname) -j Blacklist
+			iptables -I FORWARD $RULENO -m set $IPT_MATCHSET Blacklist src -j DROP
 
 			RULELIST=$RULELIST""$RULENO" "
 
@@ -400,10 +419,10 @@ case $ACTION in
 
 		logger -st "($(basename $0))" $$  "Dynamic IPSET Blacklist banning enabled."
 
-		if [ -f /jffs/scripts/HackerPorts.sh ]; then
-			logger -st "($(basename $0))" $$ "Hacker Port Activity report scheduled every 06:05 daily"
-			/usr/sbin/cru a HackerReport "5 6 * * * /jffs/scripts/HackerPorts.sh"
-		fi
+		#if [ -f /jffs/scripts/HackerPorts.sh ]; then
+			#logger -st "($(basename $0))" $$ "Hacker Port Activity report scheduled every 06:05 daily"
+			#/usr/sbin/cru a HackerReport "5 6 * * * /jffs/scripts/HackerPorts.sh"
+		#fi
 
 esac
 
@@ -464,5 +483,8 @@ fi
 echo -e "\n\t"$TEXT"\n"
 logger -t "($(basename $0))" $$ $TEXT2
 
+if [ -f /jffs/scripts/HackerPorts.sh ]; then
+	/jffs/scripts/HackerPorts.sh num=3						# Requires HackerPorts v2.xx
+fi
 
 exit 0
